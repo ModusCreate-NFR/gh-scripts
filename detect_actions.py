@@ -515,13 +515,13 @@ class ActionsAnalyzer:
                         workflow_id_map[workflow_key] = f"wf_{node_counter}"
                         node_counter += 1
                 
-                # Write node definitions
+                # Write node definitions with full paths
                 for repo, repo_id in repo_id_map.items():
                     f.write(f"    {repo_id}[\"{repo}\"]\n")
                 
                 for workflow, wf_id in workflow_id_map.items():
-                    wf_display = workflow.split('/')[-1]  # Show just filename
-                    f.write(f"    {wf_id}[\"{wf_display}\"]\n")
+                    # Keep full path: owner/repo/.github/workflows/filename.yml
+                    f.write(f"    {wf_id}[\"{workflow}\"]\n")
                 
                 # Write edges
                 for call in significant_calls:
