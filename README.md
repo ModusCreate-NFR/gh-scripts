@@ -9,6 +9,7 @@ Python scripts that scan every repository in a GitHub organization and produce r
 | `list_org_cicd.py` | CI/CD tool per repository: GitHub Actions, Jenkins, Harness, or "Not detected" |
 | `detect_lfs.py` | Git LFS usage per repository: file count, total size |
 | `detect_actions.py` | GitHub Actions usage: actions per workflow, action versions, reusable workflow dependencies with diagrams |
+| `detect_terraform_deps.py` | Terraform module dependencies: cross-repository module references, Git sources, versions with Mermaid diagrams |
 
 ## Requirements
 
@@ -142,6 +143,54 @@ graph TD
     org-frontend[org/frontend] -->|uses| org-shared
     org-infra[org/infra] -->|uses| org-shared[shared-workflows/deploy.yml]
 ```
+
+### Terraform Module Dependencies
+
+Detect and analyze Terraform module dependencies across repositories. Identifies cross-repository module references, Git sources, and versions with dependency diagrams.
+
+```bash
+python3 detect_terraform_deps.py <org>
+python3 detect_terraform_deps.py <org> --workers=5
+```
+
+| Option | Description |
+|---|---|
+| `--workers N` | Number of concurrent repositories to process (default: 5) |
+
+**Features:**
+- Scans for `.tf` files in all repositories
+- Parses Terraform `module` blocks and extracts source URLs
+- Detects Git-based module sources (GitHub, GitLab, etc.)
+- Extracts version/ref information (branch, tag, commit)
+- Identifies external module dependencies
+- Categorizes modules (Git, Registry, Local)
+- Generates dependency analysis and Mermaid diagrams
+
+**Supported Module Source Formats:**
+```hcl
+# Git HTTPS (detected as external dependency)
+source = "git::https://github.com/MyOrg/terraform-modules//vpc?ref=v1.0.0"
+
+# Git SSH (detected as external dependency)
+source = "git::ssh://git@github.com/MyOrg/terraform-modules.git//security?ref=main"
+
+# Terraform Registry (not tracked as external dependency)
+source = "terraform-aws-modules/vpc/aws"
+
+# Local modules (not tracked as external dependency)
+source = "./modules/app"
+```
+
+**Output:**
+- **JSON:** Structured data with all module definitions and dependencies
+- **CSV:** Tabular format for dependency analysis in spreadsheets
+- **Markdown:** Human-readable report with statistics and Mermaid dependency diagrams
+
+**Use Cases:**
+- Audit which repositories depend on specific modules
+- Track module version usage across organization
+- Plan module updates and compatibility testing
+- Document module architecture and relationships
 
 ## Rate limiting
 
