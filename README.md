@@ -8,6 +8,7 @@ Python scripts that scan every repository in a GitHub organization and produce r
 | `list_org_packages.py` | GitHub Packages (npm, NuGet, Maven, RubyGems, Docker, container) per repository |
 | `list_org_cicd.py` | CI/CD tool per repository: GitHub Actions, Jenkins, Harness, or "Not detected" |
 | `detect_lfs.py` | Git LFS usage per repository: file count, total size |
+| `detect_actions.py` | GitHub Actions usage: actions per workflow, action versions, reusable workflow dependencies with diagrams |
 
 ## Requirements
 
@@ -106,6 +107,41 @@ python3 detect_lfs.py <org> --max-parallel 5 --skip-archived --skip-forks
 | `--limit N` | Only process first N repositories (useful for testing) |
 
 **Output:** Repositories with LFS usage, file count, and total size.
+
+### GitHub Actions Analysis
+
+Analyze GitHub Actions usage across all repositories, including action versions and reusable workflow dependencies. Generates reports with Mermaid diagrams showing workflow call dependencies between repositories.
+
+```bash
+python3 detect_actions.py <org>
+python3 detect_actions.py <org> --max-workers=5
+```
+
+| Option | Description |
+|---|---|
+| `--max-workers N` | Number of concurrent repositories to process (default: 10) |
+
+**Features:**
+- Extracts all actions from workflow files (`.github/workflows/*.yml`)
+- Tracks reusable workflow calls between repositories
+- Identifies action versions and usage frequency
+- Generates dependency diagrams in Mermaid format
+- Reports top 20 most used actions
+- Lists all unique actions across the organization
+
+**Output:**
+- **JSON:** Raw structured data with all actions and workflow calls
+- **CSV:** Tabular format for spreadsheet analysis
+- **Markdown:** Human-readable report with statistics, action tables, and Mermaid dependency diagrams
+
+**Diagram Example:** See which repositories call reusable workflows from other repositories:
+
+```mermaid
+graph TD
+    org-backend[org/backend] -->|uses| org-shared[shared-workflows/test.yml]
+    org-frontend[org/frontend] -->|uses| org-shared
+    org-infra[org/infra] -->|uses| org-shared[shared-workflows/deploy.yml]
+```
 
 ## Rate limiting
 
