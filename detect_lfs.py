@@ -5,6 +5,8 @@ detect_lfs.py - Detect LFS files in organization repositories
 Scans every repository in a GitHub organization for Git LFS usage.
 Processes repositories in parallel with configurable concurrency.
 Reports findings in JSON, CSV, and Markdown formats.
+Scans all mirrored branch and tag history without downloading LFS payloads.
+Counts unique LFS object IDs per repository and sums their pointer-declared sizes.
 
 Usage:
     python3 detect_lfs.py <organization> [--max-parallel N] [--skip-archived] [--skip-forks] [--output-dir DIR] [--limit N]
@@ -12,6 +14,7 @@ Usage:
 Requirements:
     - GitHub CLI (gh) with authentication
     - Git with LFS support installed
+    - git-sizer installed (brew install git-sizer on macOS)
     - Python 3.8+
 
 Examples:
@@ -26,60 +29,18 @@ import subprocess
 import sys
 import os
 import tempfile
-import shutil
 import time
 from pathlib import Path
 from dataclasses import dataclass, asdict
-from typing import Optional, List
-from datetime import datetime
+from typing import Dict, Optional, List, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import argparse
+import re
 
-# Shared utilities (imported from list_org_secrets.py pattern)
-try:
-    # Try to import shared utilities if they exist
-    from list_org_secrets import get_github_token, api_call, format_number
-except ImportError:
-    # Fallback implementations
-    def get_github_token() -> str:
-        """Get GitHub token from environment or gh CLI."""
-        token = os.environ.get('GITHUB_TOKEN') or os.environ.get('GH_TOKEN')
-        if not token:
-            try:
-                result = subprocess.run(['gh', 'auth', 'token'], 
-                                      capture_output=True, text=True, check=True)
-                token = result.stdout.strip()
-            except subprocess.CalledProcessError:
-                print("Error: Cannot get GitHub token. Set GITHUB_TOKEN/GH_TOKEN or run 'gh auth login'")
-                sys.exit(1)
-        return token
 
-    def api_call(method: str, url: str, token: str, **kwargs) -> dict:
-        """Make GitHub API call."""
-        headers = {
-            'Authorization': f'token {token}',
-            'Accept': 'application/vnd.github.v3+json',
-            **kwargs.get('headers', {})
-        }
-        
-        import urllib.request
-        import urllib.error
-        
-        req = urllib.request.Request(
-            f'https://api.github.com{url}',
-            method=method,
-            headers=headers
-        )
-        
-        try:
-            with urllib.request.urlopen(req) as response:
-                return json.loads(response.read().decode())
-        except urllib.error.HTTPError as e:
-            raise Exception(f"API error {e.code}: {e.reason}")
-
-    def format_number(num: int) -> str:
-        """Format number with thousand separators."""
-        return f"{num:,}"
+def format_number(num: int) -> str:
+    """Format number with thousand separators."""
+    return f"{num:,}"
 
 
 @dataclass
@@ -90,9 +51,9 @@ class LFSAnalysisResult:
     archived: bool
     fork: bool
     status: str  # "has-lfs", "no-lfs", "error"
-    lfs_files: int
-    lfs_size_bytes: int
-    repo_size_bytes: int  # Total repository size
+    lfs_files: Optional[int]
+    lfs_size_bytes: Optional[int]
+    repo_size_bytes: Optional[int]  # git-sizer unique_blob_size (uncompressed bytes)
     repo_size_formatted: str  # Human-readable total size
     error: Optional[str]
     timestamp: int
@@ -109,8 +70,6 @@ class LFSDetector:
         self.skip_forks = skip_forks
         self.output_dir = Path(output_dir).resolve()
         self.limit = limit
-        self.token = get_github_token()
-        self.temp_dir = tempfile.mkdtemp(prefix=f"lfs-scan-{int(time.time())}-")
         self.timestamp = int(time.time())
         self.results: List[LFSAnalysisResult] = []
         
@@ -138,7 +97,7 @@ class LFSDetector:
             if self.skip_forks:
                 cmd.insert(4, '--source')
             
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=120)
             
             for line in result.stdout.strip().split('\n'):
                 if line:
@@ -151,8 +110,8 @@ class LFSDetector:
             print(f"[SUCCESS] Found {len(repos)} repositories")
             return repos
             
-        except subprocess.CalledProcessError as e:
-            print(f"[ERROR] Failed to fetch repositories: {e.stderr}")
+        except (OSError, subprocess.SubprocessError, ValueError) as e:
+            print(f"[ERROR] Failed to fetch repositories: {e}")
             sys.exit(1)
     
     def analyze_repo(self, repo_data: dict) -> LFSAnalysisResult:
@@ -164,64 +123,70 @@ class LFSDetector:
         
         print(f"[INFO] Analyzing: {repo_name}")
         
-        repo_work_dir = Path(self.temp_dir) / repo_name.replace('/', '-')
-        repo_work_dir.mkdir(parents=True, exist_ok=True)
-        
-        status = "no-lfs"
-        lfs_files = 0
-        lfs_size = 0
-        repo_size = 0
-        repo_size_formatted = "0 B"
+        status = "error"
+        lfs_files = None
+        lfs_size = None
+        repo_size = None
+        repo_size_formatted = "Unknown"
         error_msg = None
+        stage = "Reading repository metadata"
         
         try:
-            # Clone mirror
-            mirror_path = repo_work_dir / "repo.git"
-            cmd = ['git', 'clone', '--mirror', repo_url, str(mirror_path)]
-            result = subprocess.run(cmd, capture_output=True, text=True, cwd=str(repo_work_dir))
-            
-            if result.returncode != 0:
-                error_msg = f"Clone failed: {result.stderr[:100]}"
-                print(f"[ERROR] {repo_name}: {error_msg}")
-            else:
-                # Fetch LFS objects
-                os.chdir(str(mirror_path))
-                fetch_cmd = ['git', 'lfs', 'fetch', '--all', 'origin']
-                subprocess.run(fetch_cmd, capture_output=True, text=True)
-                
-                # Get repository size using git sizer
-                repo_size = self._get_repo_size(str(mirror_path))
+            env = dict(os.environ, GIT_LFS_SKIP_SMUDGE='1', GIT_TERMINAL_PROMPT='0')
+            stage = "Creating temporary clone directory"
+            with tempfile.TemporaryDirectory(prefix='lfs-scan-') as work_dir:
+                mirror_path = Path(work_dir) / 'repo.git'
+                stage = "Cloning Git history"
+                print(f"[INFO] {repo_name}: Cloning Git history (no LFS payloads)")
+                subprocess.run(
+                    ['git', 'clone', '--mirror', '--', repo_url, str(mirror_path)],
+                    capture_output=True, text=True, check=True, timeout=1800, env=env
+                )
+                stage = "Reading LFS pointers across history"
+                print(f"[INFO] {repo_name}: Reading LFS pointers across history")
+                result = subprocess.run(
+                    ['git', 'lfs', 'ls-files', '--all', '--json', '--include=', '--exclude='],
+                    cwd=mirror_path, capture_output=True, text=True, check=True,
+                    timeout=1800, env=dict(env, GIT_DIR=str(mirror_path))
+                )
+                stage = "Parsing LFS pointer output"
+                lfs_files, lfs_size = self._parse_lfs_objects(result.stdout)
+                stage = "Measuring repository size with git-sizer"
+                print(f"[INFO] {repo_name}: Measuring Git blob size with git-sizer")
+                size_result = subprocess.run(
+                    ['git', 'sizer', '--json', '--json-version=1'],
+                    cwd=mirror_path, capture_output=True, text=True, check=True,
+                    timeout=1800, env=dict(env, GIT_DIR=str(mirror_path))
+                )
+                stage = "Parsing git-sizer output"
+                size_data = json.loads(size_result.stdout)
+                if (not isinstance(size_data, dict)
+                        or type(size_data.get('unique_blob_size')) is not int
+                        or size_data['unique_blob_size'] < 0):
+                    raise ValueError("Invalid git-sizer JSON: expected nonnegative unique_blob_size")
+                repo_size = size_data['unique_blob_size']
                 repo_size_formatted = self._format_size(repo_size)
-                
-                # Get LFS info
-                info_cmd = ['git', 'lfs', 'migrate', 'info', '--everything']
-                result = subprocess.run(info_cmd, capture_output=True, text=True)
-                
-                if result.returncode == 0 and result.stdout:
-                    output = result.stdout
-                    if 'numObjects' in output:
-                        status = "has-lfs"
-                        # Parse output for LFS statistics
-                        for line in output.split('\n'):
-                            if 'numObjects:' in line:
-                                lfs_files = int(line.split(':')[1].strip() or 0)
-                            elif 'totalSize:' in line:
-                                lfs_size = int(line.split(':')[1].strip() or 0)
-                        
-                        size_str = self._format_size(lfs_size)
-                        print(f"[SUCCESS] {repo_name}: Found {lfs_files} LFS files ({size_str}) | Repo size: {repo_size_formatted}")
-                    else:
-                        print(f"[INFO] {repo_name}: No LFS files found | Repo size: {repo_size_formatted}")
-                
-        except Exception as e:
-            error_msg = str(e)[:100]
+                stage = "Cleaning up temporary clone"
+            status = "has-lfs" if lfs_files else "no-lfs"
+            print(f"[SUCCESS] {repo_name}: {lfs_files} unique LFS objects "
+                  f"({self._format_size(lfs_size)})")
+        except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError) as e:
+            if isinstance(e, subprocess.CalledProcessError):
+                reason = f"Command failed with exit code {e.returncode}"
+            elif isinstance(e, subprocess.TimeoutExpired):
+                reason = f"Command timed out after {e.timeout} seconds"
+            else:
+                reason = f"{type(e).__name__}: {e}"
+            error_msg = f"{stage}: {reason}"
+            if isinstance(e, (subprocess.CalledProcessError, subprocess.TimeoutExpired)):
+                for label, output in (('stderr', e.stderr), ('stdout', e.stdout)):
+                    if isinstance(output, bytes):
+                        output = output.decode('utf-8', errors='replace')
+                    if output and output.strip():
+                        error_msg += f"\n{label}:\n{output.strip()}"
+            lfs_files = None
+            lfs_size = None
             print(f"[ERROR] {repo_name}: {error_msg}")
-        finally:
-            # Cleanup
-            try:
-                shutil.rmtree(repo_work_dir)
-            except Exception:
-                pass
         
         result = LFSAnalysisResult(
             repository=repo_name,
@@ -238,6 +203,32 @@ class LFSDetector:
         )
         
         return result
+
+    @staticmethod
+    def _parse_lfs_objects(output: str) -> Tuple[int, int]:
+        """Sum pointer sizes once per SHA-256 object, not once per path/version."""
+        data = json.loads(output)
+        if not isinstance(data, dict) or 'files' not in data:
+            raise ValueError("Invalid Git LFS JSON: expected a files array")
+        # Git LFS encodes an empty result as null rather than [].
+        if data['files'] is None:
+            return 0, 0
+        if not isinstance(data['files'], list):
+            raise ValueError("Invalid Git LFS JSON: expected a files array")
+        objects: Dict[str, int] = {}
+        for entry in data['files']:
+            if not isinstance(entry, dict):
+                raise ValueError("Invalid Git LFS object entry")
+            oid = entry.get('oid')
+            size = entry.get('size')
+            if (entry.get('oid_type') != 'sha256' or not isinstance(oid, str)
+                    or re.fullmatch(r'[0-9a-f]{64}', oid) is None
+                    or type(size) is not int or size < 0):
+                raise ValueError("Invalid Git LFS object ID or size")
+            if oid in objects and objects[oid] != size:
+                raise ValueError(f"Conflicting sizes for LFS object {oid}")
+            objects[oid] = size
+        return len(objects), sum(objects.values())
     
     def run(self):
         """Run the LFS detection analysis."""
@@ -248,7 +239,7 @@ class LFSDetector:
         repos = self.get_repositories()
         if not repos:
             print("[WARN] No repositories found")
-            return
+            return True
         
         # Process in parallel
         with ThreadPoolExecutor(max_workers=self.max_parallel) as executor:
@@ -256,24 +247,23 @@ class LFSDetector:
             
             completed = 0
             for future in as_completed(futures):
-                try:
-                    result = future.result()
-                    self.results.append(result)
-                    completed += 1
-                    if completed % 10 == 0:
-                        print(f"[INFO] Progress: {completed}/{len(repos)} repositories analyzed")
-                except Exception as e:
-                    print(f"[ERROR] Unexpected error: {e}")
+                result = future.result()
+                self.results.append(result)
+                completed += 1
+                if completed % 10 == 0:
+                    print(f"[INFO] Progress: {completed}/{len(repos)} repositories analyzed")
         
         print(f"\n[SUCCESS] Analyzed {len(self.results)} repositories")
         
         # Generate reports
         self.generate_reports()
         
-        # Cleanup
-        shutil.rmtree(self.temp_dir, ignore_errors=True)
-        
+        errors = sum(r.status == 'error' for r in self.results)
+        if errors:
+            print(f"\n[ERROR] Analysis incomplete: {errors} repositories failed; see reports")
+            return False
         print(f"\n[SUCCESS] Analysis complete!")
+        return True
     
     def generate_reports(self):
         """Generate JSON, CSV, and Markdown reports."""
@@ -298,9 +288,9 @@ class LFSDetector:
                     'Archived': result.archived,
                     'Fork': result.fork,
                     'Status': result.status,
-                    'LFS Files': result.lfs_files,
-                    'LFS Size (bytes)': result.lfs_size_bytes,
-                    'Repo Size (bytes)': result.repo_size_bytes,
+                    'LFS Files': result.lfs_files if result.lfs_files is not None else 'Unknown',
+                    'LFS Size (bytes)': result.lfs_size_bytes if result.lfs_size_bytes is not None else 'Unknown',
+                    'Repo Size (bytes)': result.repo_size_bytes if result.repo_size_bytes is not None else 'Unknown',
                     'Repo Size (formatted)': result.repo_size_formatted,
                     'Error': result.error or 'None'
                 })
@@ -315,8 +305,9 @@ class LFSDetector:
     def _generate_markdown(self) -> str:
         """Generate Markdown report content."""
         has_lfs_repos = [r for r in self.results if r.status == 'has-lfs']
-        total_size = sum(r.lfs_size_bytes for r in has_lfs_repos)
-        total_repo_size = sum(r.repo_size_bytes for r in self.results if r.repo_size_bytes > 0)
+        total_size = sum(r.lfs_size_bytes for r in has_lfs_repos if r.lfs_size_bytes is not None)
+        errors = [r for r in self.results if r.status == 'error']
+        total_repo_size = sum(r.repo_size_bytes for r in self.results if r.repo_size_bytes is not None)
         
         # Use timezone-aware datetime to avoid deprecation warning
         from datetime import datetime, timezone
@@ -334,118 +325,95 @@ class LFSDetector:
 |--------|-------|
 | Total Repositories | {format_number(len(self.results))} |
 | Repositories with LFS | {format_number(len(has_lfs_repos))} |
+| Failed Repositories | {format_number(len(errors))} |
 | Total LFS Size | {self._format_size(total_size)} |
 | Total Repository Size | {self._format_size(total_repo_size)} |
 
+LFS counts are unique object IDs per repository across all mirrored branch/tag
+history, including deleted files. Sizes come from pointers; payload availability
+and GitHub billing usage are not verified. Objects shared across repositories
+are counted once in each repository.
+Repository size is git-sizer's unique_blob_size: total uncompressed bytes of
+distinct reachable Git file blobs across history, including LFS pointer files
+but excluding LFS payloads, commits, trees, and tags. This is not compressed
+disk usage or an LFS percentage denominator. Repository size totals exclude
+unknown measurements.
+
 """
+        if errors:
+            md += "**INCOMPLETE:** LFS totals exclude failed repositories; their sizes are unknown.\n\n"
+            md += "## Failed repositories\n\n"
+            for result in errors:
+                message = result.error or 'Unknown error'
+                md += f"### [{result.repository}]({result.url})\n\n"
+                md += "- **Status:** error\n- **Reason:**\n\n"
+                md += "\n".join(f"    {line}" for line in message.splitlines()) + "\n\n"
         
         if has_lfs_repos:
             md += """## Repositories with LFS
 
 """
-            for result in sorted(has_lfs_repos, key=lambda x: x.lfs_size_bytes, reverse=True):
-                lfs_percentage = (result.lfs_size_bytes / result.repo_size_bytes * 100) if result.repo_size_bytes > 0 else 0
+            for result in sorted(has_lfs_repos, key=lambda x: x.lfs_size_bytes or 0, reverse=True):
+                assert result.lfs_files is not None and result.lfs_size_bytes is not None
                 md += f"""### [{result.repository}]({result.url})
 
 - **Status:** {result.status}
-- **LFS Files:** {format_number(result.lfs_files)}
-- **LFS Size:** {self._format_size(result.lfs_size_bytes)} ({lfs_percentage:.1f}% of repo)
+- **LFS Files (unique objects):** {format_number(result.lfs_files)}
+- **LFS Size:** {self._format_size(result.lfs_size_bytes)}
 - **Total Repository Size:** {result.repo_size_formatted}
 - **Archived:** {result.archived}
 - **Fork:** {result.fork}
 
 """
         else:
-            md += "No repositories with LFS files detected.\n\n"
+            md += "No LFS objects found in successfully scanned repositories.\n\n"
         
         return md
     
     @staticmethod
     def _format_size(bytes_size: int) -> str:
-        """Format bytes to human-readable size."""
-        for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
-            if bytes_size < 1024.0:
-                return f"{bytes_size:.2f} {unit}"
-            bytes_size /= 1024.0
-        return f"{bytes_size:.2f} PB"
-    
-    def _get_repo_size(self, repo_path: str) -> int:
-        """Get total repository size using git sizer or fallback method."""
-        try:
-            # Try using git sizer if available
-            try:
-                result = subprocess.run(
-                    ['git', 'sizer', '--verbose'],
-                    capture_output=True,
-                    text=True,
-                    cwd=repo_path,
-                    timeout=60
-                )
-                
-                if result.returncode == 0 and result.stdout:
-                    # Parse git sizer output for total size
-                    for line in result.stdout.split('\n'):
-                        if 'total file size' in line.lower():
-                            # Extract size from line like "total file size:   1234567890"
-                            parts = line.split(':')
-                            if len(parts) > 1:
-                                try:
-                                    size_str = parts[1].strip().split()[0]
-                                    size = int(size_str)
-                                    if size > 0:
-                                        return size
-                                except (ValueError, IndexError):
-                                    pass
-            except (subprocess.TimeoutExpired, FileNotFoundError):
-                pass
-            
-            # Fallback 1: use du with platform-specific flags
-            # macOS uses -s (no -b), Linux uses -sb for bytes
-            try:
-                import platform
-                if platform.system() == "Darwin":  # macOS
-                    # macOS du returns bytes by default with -s
-                    result = subprocess.run(
-                        ['du', '-s', repo_path],
-                        capture_output=True,
-                        text=True,
-                        timeout=30
-                    )
-                else:  # Linux and others
-                    result = subprocess.run(
-                        ['du', '-sb', repo_path],
-                        capture_output=True,
-                        text=True,
-                        timeout=30
-                    )
-                
-                if result.returncode == 0 and result.stdout.strip():
-                    size_bytes = int(result.stdout.split()[0])
-                    if size_bytes > 0:
-                        return size_bytes
-            except (subprocess.TimeoutExpired, FileNotFoundError, ValueError, IndexError):
-                pass
-            
-            # Fallback 2: use Python's os.walk to calculate size
-            try:
-                import os
-                total_size = 0
-                for dirpath, dirnames, filenames in os.walk(repo_path):
-                    for filename in filenames:
-                        filepath = os.path.join(dirpath, filename)
-                        try:
-                            total_size += os.path.getsize(filepath)
-                        except (OSError, FileNotFoundError):
-                            pass
-                if total_size > 0:
-                    return total_size
-            except Exception:
-                pass
-            
-        except Exception as e:
-            pass
-        
-        return 0
+        """Format decimal sizes with the same rounding as Git LFS."""
+        if bytes_size < 1000:
+            return f"{bytes_size} B"
+        divisor = 1000
+        for unit in ['KB', 'MB', 'GB', 'TB', 'PB', 'EB']:
+            if bytes_size < divisor * 1000 or unit == 'EB':
+                # Git LFS rounds to tenths before choosing display precision.
+                size = ((bytes_size * 10 + divisor // 2) // divisor) / 10
+                return f"{size:.1f} {unit}" if size < 10 else f"{size:.0f} {unit}"
+            divisor *= 1000
+        raise ValueError("Size exceeds supported units")
+
+
+def check_lfs_installed():
+    """Check if Git LFS is installed."""
+    try:
+        result = subprocess.run(['git', 'lfs', 'version'], 
+                              capture_output=True, text=True, check=True)
+        print(f"[SUCCESS] Git LFS is installed: {result.stdout.strip()}")
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        print("[ERROR] Git LFS is not installed or not available in PATH")
+        print("[ERROR] Please install Git LFS:")
+        print("[ERROR]   macOS:  brew install git-lfs")
+        print("[ERROR]   Linux:  apt-get install git-lfs (Debian/Ubuntu) or yum install git-lfs (RHEL/CentOS)")
+        print("[ERROR]   Other:  https://git-lfs.github.com/")
+        print("[ERROR] After installation, run: git lfs install")
+        sys.exit(1)
+
+
+def check_sizer_installed():
+    """Fail before scanning if git-sizer cannot run."""
+    try:
+        result = subprocess.run(
+            ['git', 'sizer', '--version'],
+            capture_output=True, text=True, check=True, timeout=30
+        )
+        print(f"[SUCCESS] git-sizer is installed: {result.stdout.strip()}")
+    except (OSError, subprocess.SubprocessError) as e:
+        print(f"[ERROR] git-sizer is not installed or cannot run: {e}")
+        print("[ERROR] macOS: brew install git-sizer")
+        print("[ERROR] Other platforms: https://github.com/github/git-sizer/releases")
+        sys.exit(1)
 
 
 def main():
@@ -469,6 +437,9 @@ def main():
     
     args = parser.parse_args()
     
+    check_lfs_installed()
+    check_sizer_installed()
+    
     detector = LFSDetector(
         org=args.organization,
         max_parallel=args.max_parallel,
@@ -478,7 +449,8 @@ def main():
         limit=args.limit
     )
     
-    detector.run()
+    if not detector.run():
+        sys.exit(1)
 
 
 if __name__ == '__main__':
