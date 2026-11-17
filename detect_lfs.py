@@ -9,7 +9,7 @@ Scans all mirrored branch and tag history without downloading LFS payloads.
 Counts unique LFS object IDs per repository and sums their pointer-declared sizes.
 
 Usage:
-    python3 detect_lfs.py <organization> [--max-parallel N] [--skip-archived] [--skip-forks] [--output-dir DIR] [--limit N]
+    python3 detect_lfs.py <organization> [--repos REPO [REPO ...]] [--max-parallel N] [--skip-archived] [--skip-forks] [--output-dir DIR] [--limit N]
 
 Requirements:
     - GitHub CLI (gh) with authentication
@@ -20,6 +20,7 @@ Requirements:
 Examples:
     python3 detect_lfs.py myorg
     python3 detect_lfs.py myorg --max-parallel 5 --skip-archived --output-dir ./reports
+    python3 detect_lfs.py myorg --repos repo-one repo-two
     python3 detect_lfs.py myorg --limit 10  # Test with first 10 repos
 """
 
@@ -28,6 +29,7 @@ import csv
 import subprocess
 import sys
 import os
+import shutil
 import tempfile
 import time
 from pathlib import Path
@@ -63,13 +65,15 @@ class LFSDetector:
     """Detect LFS usage in GitHub organization repositories."""
     
     def __init__(self, org: str, max_parallel: int = 10, skip_archived: bool = False, 
-                 skip_forks: bool = False, output_dir: str = "./reports", limit: Optional[int] = None):
+                 skip_forks: bool = False, output_dir: str = "./reports",
+                 limit: Optional[int] = None, repos: Optional[List[str]] = None):
         self.org = org
         self.max_parallel = max_parallel
         self.skip_archived = skip_archived
         self.skip_forks = skip_forks
         self.output_dir = Path(output_dir).resolve()
         self.limit = limit
+        self.repos = repos
         self.timestamp = int(time.time())
         self.results: List[LFSAnalysisResult] = []
         
@@ -104,6 +108,27 @@ class LFSDetector:
                     repo_data = json.loads(line)
                     repos.append(repo_data)
             
+            if self.repos:
+                by_full_name = {
+                    repo['nameWithOwner'].casefold(): repo for repo in repos
+                }
+                by_name = {
+                    repo['nameWithOwner'].split('/', 1)[-1].casefold(): repo
+                    for repo in repos
+                }
+                selected = []
+                missing = []
+                for name in self.repos:
+                    repo = (by_full_name if '/' in name else by_name).get(name.casefold())
+                    if repo is None:
+                        missing.append(name)
+                    elif repo not in selected:
+                        selected.append(repo)
+                if missing:
+                    print(f"[ERROR] Repositories not found in {self.org}: {', '.join(missing)}")
+                    sys.exit(1)
+                repos = selected
+
             if self.limit:
                 repos = repos[:self.limit]
             
@@ -134,20 +159,21 @@ class LFSDetector:
         try:
             env = dict(os.environ, GIT_LFS_SKIP_SMUDGE='1', GIT_TERMINAL_PROMPT='0')
             stage = "Creating temporary clone directory"
-            with tempfile.TemporaryDirectory(prefix='lfs-scan-') as work_dir:
+            work_dir = tempfile.mkdtemp(prefix='lfs-scan-')
+            try:
                 mirror_path = Path(work_dir) / 'repo.git'
                 stage = "Cloning Git history"
                 print(f"[INFO] {repo_name}: Cloning Git history (no LFS payloads)")
                 subprocess.run(
                     ['git', 'clone', '--mirror', '--', repo_url, str(mirror_path)],
-                    capture_output=True, text=True, check=True, timeout=1800, env=env
+                    capture_output=True, text=True, check=True, timeout=7200, env=env
                 )
                 stage = "Reading LFS pointers across history"
                 print(f"[INFO] {repo_name}: Reading LFS pointers across history")
                 result = subprocess.run(
                     ['git', 'lfs', 'ls-files', '--all', '--json', '--include=', '--exclude='],
                     cwd=mirror_path, capture_output=True, text=True, check=True,
-                    timeout=1800, env=dict(env, GIT_DIR=str(mirror_path))
+                    timeout=7200, env=dict(env, GIT_DIR=str(mirror_path))
                 )
                 stage = "Parsing LFS pointer output"
                 lfs_files, lfs_size = self._parse_lfs_objects(result.stdout)
@@ -156,7 +182,7 @@ class LFSDetector:
                 size_result = subprocess.run(
                     ['git', 'sizer', '--json', '--json-version=1'],
                     cwd=mirror_path, capture_output=True, text=True, check=True,
-                    timeout=1800, env=dict(env, GIT_DIR=str(mirror_path))
+                    timeout=7200, env=dict(env, GIT_DIR=str(mirror_path))
                 )
                 stage = "Parsing git-sizer output"
                 size_data = json.loads(size_result.stdout)
@@ -166,7 +192,11 @@ class LFSDetector:
                     raise ValueError("Invalid git-sizer JSON: expected nonnegative unique_blob_size")
                 repo_size = size_data['unique_blob_size']
                 repo_size_formatted = self._format_size(repo_size)
+            finally:
+                previous_stage = stage
                 stage = "Cleaning up temporary clone"
+                self._cleanup_temp_dir(work_dir)
+                stage = previous_stage
             status = "has-lfs" if lfs_files else "no-lfs"
             print(f"[SUCCESS] {repo_name}: {lfs_files} unique LFS objects "
                   f"({self._format_size(lfs_size)})")
@@ -203,6 +233,17 @@ class LFSDetector:
         )
         
         return result
+
+    @staticmethod
+    def _cleanup_temp_dir(path: str) -> None:
+        for attempt in range(5):
+            try:
+                shutil.rmtree(path)
+                return
+            except PermissionError as e:
+                if getattr(e, 'winerror', None) != 32 or attempt == 4:
+                    raise
+                time.sleep(0.5)
 
     @staticmethod
     def _parse_lfs_objects(output: str) -> Tuple[int, int]:
@@ -424,6 +465,8 @@ def main():
     )
     
     parser.add_argument('organization', help='GitHub organization name')
+    parser.add_argument('--repos', nargs='+', metavar='REPO',
+                       help='Only scan these repositories (names or org/name)')
     parser.add_argument('--max-parallel', type=int, default=10, 
                        help='Maximum parallel analysis jobs (default: 10)')
     parser.add_argument('--skip-archived', action='store_true',
@@ -446,7 +489,8 @@ def main():
         skip_archived=args.skip_archived,
         skip_forks=args.skip_forks,
         output_dir=args.output_dir,
-        limit=args.limit
+        limit=args.limit,
+        repos=args.repos
     )
     
     if not detector.run():
